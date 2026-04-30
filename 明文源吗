@@ -1,5 +1,5 @@
-    // CFnew - 终端 v3.0.2
-    // 版本: v3.0.2
+    // CFnew - 终端 v3.0.3
+    // 版本: v3.0.3
     import { connect } from 'cloudflare:sockets';
 
     // === 统计系统核心配置 ===
