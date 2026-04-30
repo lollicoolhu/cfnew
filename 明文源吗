@@ -1,6 +1,275 @@
-    // CFnew - 终端 v2.9.6
-    // 版本: v2.9.6 
+    // CFnew - 终端 v3.0.0
+    // 版本: v3.0.0
     import { connect } from 'cloudflare:sockets';
+
+    // === 统计系统核心配置 ===
+    const STATS_VERSION = 'v2';
+    const STATS_KEY_PREFIX = `stats:${STATS_VERSION}`;
+    const UV_EXPIRATION = 24 * 60 * 60; // UV 记录保留 24 小时
+    const STATS_RETENTION = {
+        h: 30,   // 小时级数据保留 30 天
+        d: 365,  // 日级数据保留 365 天
+    };
+
+    class StatsManager {
+        // 记录一次请求的统计数据
+        // reqType: 'page' | 'sub' | 'ws' | 'api'
+        // options: { proto, statusCode }
+        static async record(request, env, ctx, reqType = 'page', options = {}) {
+            const kv = env.C;
+            if (!kv) return;
+            ctx.waitUntil((async () => {
+                try {
+                    const now = new Date();
+                    const year = now.getFullYear();
+                    const month = String(now.getMonth() + 1).padStart(2, '0');
+                    const day = String(now.getDate()).padStart(2, '0');
+                    const hour = String(now.getHours()).padStart(2, '0');
+
+                    // 获取客户端类型
+                    const ua = request.headers.get('User-Agent') || '';
+                    let client = 'Other';
+                    if (/clash/i.test(ua)) client = 'Clash';
+                    else if (/surge/i.test(ua)) client = 'Surge';
+                    else if (/shadowrocket/i.test(ua)) client = 'Shadowrocket';
+                    else if (/sing-box/i.test(ua)) client = 'Sing-box';
+                    else if (/v2ray/i.test(ua)) client = 'V2Ray';
+                    else if (/stash/i.test(ua)) client = 'Stash';
+                    else if (/loon/i.test(ua)) client = 'Loon';
+                    else if (/quantumult/i.test(ua)) client = 'QuantumultX';
+                    else if (/mozilla|chrome|safari|firefox|edge/i.test(ua)) client = 'Browser';
+
+                    // 获取地区
+                    const region = (request.cf && request.cf.country) || 'unknown';
+
+                    // 状态码分组
+                    const statusCode = options.statusCode || 200;
+                    const statusGroup = statusCode < 300 ? '2xx' : statusCode < 500 ? '4xx' : '5xx';
+
+                    // 时间维度标识
+                    const periods = {
+                        h: `${year}${month}${day}${hour}`,
+                        d: `${year}${month}${day}`,
+                        m: `${year}${month}`,
+                        y: `${year}`,
+                        all: 'total'
+                    };
+
+                    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+
+                    for (const [unit, val] of Object.entries(periods)) {
+                        const statsKey = `${STATS_KEY_PREFIX}:${unit}:${val}`;
+                        // 读取现有统计数据
+                        let stats;
+                        try {
+                            const raw = await kv.get(statsKey);
+                            stats = raw ? JSON.parse(raw) : {};
+                        } catch (e) {
+                            stats = {};
+                        }
+
+                        // 初始化结构
+                        if (!stats.pv) stats.pv = 0;
+                        if (!stats.clients) stats.clients = {};
+                        if (!stats.region) stats.region = {};
+                        if (!stats.status) stats.status = {};
+                        if (!stats.proto) stats.proto = {};
+                        if (!stats.conn) stats.conn = 0;
+                        if (!stats.traffic) stats.traffic = { up: 0, down: 0 };
+                        if (!stats.uv) stats.uv = 0;
+                        // 按请求类型计数
+                        if (!stats.ws) stats.ws = 0;
+                        if (!stats.sub) stats.sub = 0;
+                        if (!stats.page) stats.page = 0;
+                        if (!stats.api) stats.api = 0;
+
+                        // 累加
+                        stats.pv++;
+                        stats[reqType] = (stats[reqType] || 0) + 1;
+                        stats.clients[client] = (stats.clients[client] || 0) + 1;
+                        stats.region[region] = (stats.region[region] || 0) + 1;
+                        stats.status[statusGroup] = (stats.status[statusGroup] || 0) + 1;
+
+                        if (options.proto) {
+                            stats.proto[options.proto] = (stats.proto[options.proto] || 0) + 1;
+                        }
+
+                        // 连接数（仅 ws 类型）
+                        if (reqType === 'ws') {
+                            stats.conn++;
+                        }
+
+                        // UV 去重
+                        const uvKey = `${STATS_KEY_PREFIX}:uv:${unit}:${val}:${ip}`;
+                        const isExistingUV = await kv.get(uvKey);
+                        if (!isExistingUV) {
+                            await kv.put(uvKey, '1', { expirationTtl: UV_EXPIRATION });
+                            stats.uv++;
+                        }
+
+                        // 写回
+                        await kv.put(statsKey, JSON.stringify(stats));
+                    }
+                } catch (e) {
+                    // 统计记录不应影响主请求
+                }
+            })());
+        }
+
+        // 记录流量（在连接关闭时调用）
+        static async recordTraffic(env, ctx, uploadBytes, downloadBytes) {
+            const kv = env.C;
+            if (!kv || (!uploadBytes && !downloadBytes)) return;
+            ctx.waitUntil((async () => {
+                try {
+                    const now = new Date();
+                    const year = now.getFullYear();
+                    const month = String(now.getMonth() + 1).padStart(2, '0');
+                    const day = String(now.getDate()).padStart(2, '0');
+                    const hour = String(now.getHours()).padStart(2, '0');
+
+                    const periods = {
+                        h: `${year}${month}${day}${hour}`,
+                        d: `${year}${month}${day}`,
+                        m: `${year}${month}`,
+                        y: `${year}`,
+                        all: 'total'
+                    };
+
+                    for (const [unit, val] of Object.entries(periods)) {
+                        const statsKey = `${STATS_KEY_PREFIX}:${unit}:${val}`;
+                        let stats;
+                        try {
+                            const raw = await kv.get(statsKey);
+                            stats = raw ? JSON.parse(raw) : {};
+                        } catch (e) {
+                            stats = {};
+                        }
+                        if (!stats.traffic) stats.traffic = { up: 0, down: 0 };
+                        stats.traffic.up += (uploadBytes || 0);
+                        stats.traffic.down += (downloadBytes || 0);
+                        await kv.put(statsKey, JSON.stringify(stats));
+                    }
+                } catch (e) {}
+            })());
+        }
+
+        // 获取单个时间段的统计数据
+        static async getStats(env, unit, val) {
+            const kv = env.C;
+            if (!kv) return null;
+            const statsKey = `${STATS_KEY_PREFIX}:${unit}:${val}`;
+            try {
+                const raw = await kv.get(statsKey);
+                return raw ? JSON.parse(raw) : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        // 获取仪表盘摘要（今日、昨日、本月、全部 + 最近24小时趋势）
+        static async getSummary(env) {
+            const now = new Date();
+            const year = now.getFullYear();
+            const month = String(now.getMonth() + 1).padStart(2, '0');
+            const day = String(now.getDate()).padStart(2, '0');
+
+            const yesterday = new Date(now);
+            yesterday.setDate(yesterday.getDate() - 1);
+            const yYear = yesterday.getFullYear();
+            const yMonth = String(yesterday.getMonth() + 1).padStart(2, '0');
+            const yDay = String(yesterday.getDate()).padStart(2, '0');
+
+            const [today, yesterdayStats, thisMonth, allTime] = await Promise.all([
+                this.getStats(env, 'd', `${year}${month}${day}`),
+                this.getStats(env, 'd', `${yYear}${yMonth}${yDay}`),
+                this.getStats(env, 'm', `${year}${month}`),
+                this.getStats(env, 'all', 'total')
+            ]);
+
+            // 获取最近24小时趋势数据
+            const hourlyTrend = [];
+            for (let i = 23; i >= 0; i--) {
+                const h = new Date(now.getTime() - i * 3600000);
+                const hKey = `${h.getFullYear()}${String(h.getMonth() + 1).padStart(2, '0')}${String(h.getDate()).padStart(2, '0')}${String(h.getHours()).padStart(2, '0')}`;
+                const hStats = await this.getStats(env, 'h', hKey);
+                hourlyTrend.push({
+                    hour: `${String(h.getHours()).padStart(2, '0')}:00`,
+                    pv: hStats?.pv || 0,
+                    uv: hStats?.uv || 0,
+                    conn: hStats?.conn || 0,
+                    trafficUp: hStats?.traffic?.up || 0,
+                    trafficDown: hStats?.traffic?.down || 0
+                });
+            }
+
+            return {
+                today: today || this._emptyStats(),
+                yesterday: yesterdayStats || this._emptyStats(),
+                thisMonth: thisMonth || this._emptyStats(),
+                allTime: allTime || this._emptyStats(),
+                hourlyTrend
+            };
+        }
+
+        // 清理过期数据
+        static async cleanup(env, ctx) {
+            const kv = env.C;
+            if (!kv) return;
+            ctx.waitUntil((async () => {
+                try {
+                    const now = new Date();
+                    // 清理过期的小时级数据（保留30天）
+                    const hourCutoff = new Date(now.getTime() - STATS_RETENTION.h * 24 * 3600000);
+                    // 清理过期的日级数据（保留365天）
+                    const dayCutoff = new Date(now.getTime() - STATS_RETENTION.d * 24 * 3600000);
+
+                    const prefixes = [
+                        { prefix: `${STATS_KEY_PREFIX}:h:`, cutoff: hourCutoff, unit: 'h' },
+                        { prefix: `${STATS_KEY_PREFIX}:d:`, cutoff: dayCutoff, unit: 'd' },
+                    ];
+
+                    for (const { prefix, cutoff, unit } of prefixes) {
+                        const list = await kv.list({ prefix });
+                        for (const key of list.keys) {
+                            const dateStr = key.name.replace(prefix, '');
+                            let keyDate;
+                            if (unit === 'h' && dateStr.length === 10) {
+                                // 格式: YYYYMMDDHH
+                                keyDate = new Date(
+                                    parseInt(dateStr.slice(0, 4)),
+                                    parseInt(dateStr.slice(4, 6)) - 1,
+                                    parseInt(dateStr.slice(6, 8)),
+                                    parseInt(dateStr.slice(8, 10))
+                                );
+                            } else if (unit === 'd' && dateStr.length === 8) {
+                                // 格式: YYYYMMDD
+                                keyDate = new Date(
+                                    parseInt(dateStr.slice(0, 4)),
+                                    parseInt(dateStr.slice(4, 6)) - 1,
+                                    parseInt(dateStr.slice(6, 8))
+                                );
+                            }
+                            if (keyDate && keyDate < cutoff) {
+                                await kv.delete(key.name);
+                            }
+                        }
+                    }
+
+                    // 同时清理过期的 UV 去重 key（由 TTL 自动清理，无需手动）
+                } catch (e) {}
+            })());
+        }
+
+        static _emptyStats() {
+            return {
+                pv: 0, uv: 0, ws: 0, sub: 0, page: 0, api: 0,
+                clients: {}, proto: {}, region: {}, status: {},
+                conn: 0, traffic: { up: 0, down: 0 }
+            };
+        }
+    }
+
     let at = '351c9981-04b6-4103-aa4b-864aa9c91469';
     let fallbackAddress = '';
     let socks5Config = '';
@@ -39,6 +308,10 @@
     let kvConfig = {};
     let kvConfigLastLoad = 0;
     const KV_CACHE_TTL = 5 * 60 * 60 * 1000; // 5小时缓存
+
+    // 模块级别的 env/ctx 引用，供嵌套函数访问统计
+    let _env = null;
+    let _ctx = null;
 
     const regionMapping = {
         'HK': ['🇭🇰 香港', 'HK', 'Hong Kong'],
@@ -337,6 +610,10 @@
     export default {
         async fetch(request, env, ctx) {
             try {
+                // 保存 env/ctx 到模块级变量，供统计系统使用
+                _env = env;
+                _ctx = ctx;
+
                 const isWebSocket = request.headers.get('Upgrade') === atob('d2Vic29ja2V0');
                 const isPost = request.method === 'POST';
                 const reqUrl = new URL(request.url);
@@ -543,6 +820,7 @@
                         }
 
                         if (isValid) {
+                            StatsManager.record(request, env, ctx, 'api');
                             return await handleConfigAPI(request);
                         } else {
                             return new Response(JSON.stringify({ error: '路径验证失败' }), { 
@@ -589,7 +867,35 @@
                     });
                 }
 
+                // === 统计 API 路由 ===
+                if (url.pathname.includes('/api/stats')) {
+                    const pathParts = url.pathname.split('/').filter(p => p);
+                    const apiIndex = pathParts.indexOf('api');
+                    if (apiIndex > 0) {
+                        const pathSegments = pathParts.slice(0, apiIndex);
+                        const pathIdentifier = pathSegments.join('/');
+
+                        let isValid = false;
+                        if (cp && cp.trim()) {
+                            const cleanCustomPath = cp.trim().startsWith('/') ? cp.trim().substring(1) : cp.trim();
+                            isValid = (pathIdentifier === cleanCustomPath);
+                        } else {
+                            isValid = (isValidFormat(pathIdentifier) && pathIdentifier === at);
+                        }
+
+                        if (isValid) {
+                            return await handleStatsAPI(request, env);
+                        } else {
+                            return new Response(JSON.stringify({ error: '路径验证失败' }), { 
+                                status: 403,
+                                headers: { 'Content-Type': 'application/json' }
+                            });
+                        }
+                    }
+                }
+
             if (request.method === 'POST' && ex) {
+                StatsManager.record(request, env, ctx, 'ws', { proto: 'xhttp' });
                 const r = await handleXhttpPost(request);
                 if (r) {
                     ctx.waitUntil(r.closed);
@@ -607,6 +913,9 @@
             }
 
             if (request.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
+                StatsManager.record(request, env, ctx, 'ws');
+                // 每100次请求触发一次数据清理
+                if (Math.random() < 0.01) StatsManager.cleanup(env, ctx);
                 return await handleWsRequest(request);
                 }
 
@@ -1184,6 +1493,7 @@
         </script>
     </body>
     </html>`;
+            StatsManager.record(request, env, ctx, 'page');
             return new Response(terminalHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         }
             if (cp && cp.trim()) {
@@ -1192,10 +1502,12 @@
                 const normalizedPath = url.pathname.endsWith('/') && url.pathname.length > 1 ? url.pathname.slice(0, -1) : url.pathname;
 
                     if (normalizedPath === normalizedCustomPath) {
+                        StatsManager.record(request, env, ctx, 'page');
                         return await handleSubscriptionPage(request, at);
                     }
 
                     if (normalizedPath === normalizedCustomPath + '/sub') {
+                        StatsManager.record(request, env, ctx, 'sub');
                         return await handleSubscriptionRequest(request, at, url);
                     }
 
@@ -1217,6 +1529,7 @@
                         const user = url.pathname.replace(/\/$/, '').substring(1);
                         if (isValidFormat(user)) {
                             if (user === at) {
+                                StatsManager.record(request, env, ctx, 'page');
                                 return await handleSubscriptionPage(request, user);
                             } else {
                                 return new Response(JSON.stringify({ error: 'UUID错误 请注意变量名称是u不是uuid' }), { 
@@ -1232,6 +1545,7 @@
                             const user = pathParts[0].substring(1);
                             if (isValidFormat(user)) {
                                 if (user === at) {
+                                    StatsManager.record(request, env, ctx, 'sub');
                                     return await handleSubscriptionRequest(request, user, url);
                                 } else {
                                     return new Response(JSON.stringify({ error: 'UUID错误' }), { 
@@ -1244,6 +1558,7 @@
                         }
                     }
                     if (url.pathname.toLowerCase().includes(`/${subPath}`)) {
+                        StatsManager.record(request, env, ctx, 'sub');
                         return await handleSubscriptionRequest(request, at);
                     }
                 }
@@ -2060,8 +2375,10 @@
         const earlyData = request.headers.get(atob('c2VjLXdlYnNvY2tldC1wcm90b2NvbA==')) || '';
         const readable = makeReadableStream(serverSock, earlyData);
 
+        let uploadBytes = 0;
         readable.pipeTo(new WritableStream({
             async write(chunk) {
+                uploadBytes += chunk.byteLength || 0;
                 if (isDnsQuery) return await forwardUDP(chunk, serverSock, null);
                 if (remoteConnWrapper.socket) {
                     const writer = remoteConnWrapper.socket.writable.getWriter();
@@ -2075,6 +2392,8 @@
                         const vlessResult = parseWsPacketHeader(chunk, at);
                         if (!vlessResult.hasError) {
                             protocolType = 'vless';
+                            // 记录协议类型
+                            if (_env && _ctx) StatsManager.record(request, _env, _ctx, 'ws', { proto: 'vless' });
                             const { addressType, port, hostname, rawIndex, version, isUDP } = vlessResult;
                 if (isUDP) {
                     if (port === 53) isDnsQuery = true;
@@ -2092,6 +2411,8 @@
                         const tjResult = await parseTrojanHeader(chunk, at);
                         if (!tjResult.hasError) {
                             protocolType = atob('dHJvamFu');
+                            // 记录协议类型
+                            if (_env && _ctx) StatsManager.record(request, _env, _ctx, 'ws', { proto: 'trojan' });
                             const { addressType, port, hostname, rawClientData } = tjResult;
                             await forwardTCP(addressType, hostname, port, rawClientData, serverSock, null, remoteConnWrapper, reqFallback, effectiveRegion, reqRm, reqSocksConfig);
                             return;
@@ -2101,7 +2422,12 @@
                     throw new Error('Invalid protocol or authentication failed');
                 }
             },
-        })).catch((err) => { });
+        })).catch((err) => { }).finally(() => {
+            // 记录上传流量
+            if (uploadBytes > 0 && _env && _ctx) {
+                StatsManager.recordTraffic(_env, _ctx, uploadBytes, 0);
+            }
+        });
 
         return new Response(null, { status: 101, webSocket: clientSock });
     }
@@ -2223,10 +2549,12 @@
 
     async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
         let header = headerData, hasData = false;
+        let downloadBytes = 0;
         await remoteSocket.readable.pipeTo(
             new WritableStream({
                 async write(chunk, controller) {
                     hasData = true;
+                    downloadBytes += chunk.byteLength || 0;
                     if (webSocket.readyState !== 1) controller.error(E_WS_NOT_OPEN);
                     if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; } 
                     else { webSocket.send(chunk); }
@@ -2234,6 +2562,10 @@
                 abort(reason) { },
             })
         ).catch((error) => { closeSocketQuietly(webSocket); });
+        // 记录下载流量
+        if (downloadBytes > 0 && _env && _ctx) {
+            StatsManager.recordTraffic(_env, _ctx, 0, downloadBytes);
+        }
         if (!hasData && retryFunc) retryFunc();
     }
 
@@ -2450,7 +2782,7 @@
                     KR: '🇰🇷 韩国', DE: '🇩🇪 德国', SE: '🇸🇪 瑞典', NL: '🇳🇱 荷兰',
                     FI: '🇫🇮 芬兰', GB: '🇬🇧 英国'
                 },
-                terminal: '终端 v2.9.6',
+                terminal: '终端 v3.0.0',
                 githubProject: 'GitHub 项目',
                 autoDetectClient: '自动识别',
                 selectionLogicText: '同地区 → 邻近地区 → 其他地区',
@@ -2476,7 +2808,33 @@
                 kvNotEnabled: 'KV存储未配置',
                 kvCheckFailed: 'KV存储检测失败: 响应格式错误',
                 kvCheckFailedStatus: 'KV存储检测失败 - 状态码: ',
-                kvCheckFailedError: 'KV存储检测失败 - 错误: '
+                kvCheckFailedError: 'KV存储检测失败 - 错误: ',
+                // 统计相关
+                statsTitle: '[ 📊 访问统计 ]',
+                statsLoading: '加载统计数据中...',
+                statsError: '加载统计数据失败',
+                statsToday: '今日',
+                statsYesterday: '昨日',
+                statsThisMonth: '本月',
+                statsAllTime: '全部',
+                statsPV: '访问量',
+                statsUV: '独立访客',
+                statsConn: '连接数',
+                statsTraffic: '流量',
+                statsUpload: '上传',
+                statsDownload: '下载',
+                statsClients: '客户端分布',
+                statsProto: '协议分布',
+                statsRegion: '地区分布',
+                statsReqType: '请求类型',
+                statsTrend: '趋势 (近24小时)',
+                statsRefresh: '刷新统计',
+                statsWs: '代理',
+                statsSub: '订阅',
+                statsPage: '页面',
+                statsApi: 'API',
+                statsVsYesterday: 'vs 昨日',
+                statsNoData: '暂无数据'
             },
             fa: {
                 title: 'مرکز اشتراک',
@@ -2590,7 +2948,7 @@
                     KR: '🇰🇷 کره جنوبی', DE: '🇩🇪 آلمان', SE: '🇸🇪 سوئد', NL: '🇳🇱 هلند',
                     FI: '🇫🇮 فنلاند', GB: '🇬🇧 بریتانیا'
                 },
-                terminal: 'ترمینال v2.9.6',
+                terminal: 'ترمینال v3.0.0',
                 githubProject: 'پروژه GitHub',
                 autoDetectClient: 'تشخیص خودکار',
                 selectionLogicText: 'هم‌منطقه → منطقه مجاور → سایر مناطق',
@@ -2616,7 +2974,33 @@
                 kvNotEnabled: 'ذخیره‌سازی KV پیکربندی نشده است',
                 kvCheckFailed: 'بررسی ذخیره‌سازی KV ناموفق: خطای فرمت پاسخ',
                 kvCheckFailedStatus: 'بررسی ذخیره‌سازی KV ناموفق - کد وضعیت: ',
-                kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: '
+                kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: ',
+                // آمار
+                statsTitle: '[ 📊 آمار بازدید ]',
+                statsLoading: 'در حال بارگذاری آمار...',
+                statsError: 'بارگذاری آمار ناموفق',
+                statsToday: 'امروز',
+                statsYesterday: 'دیروز',
+                statsThisMonth: 'این ماه',
+                statsAllTime: 'کل',
+                statsPV: 'بازدید',
+                statsUV: 'بازدیدکننده منحصر به فرد',
+                statsConn: 'اتصالات',
+                statsTraffic: 'ترافیک',
+                statsUpload: 'آپلود',
+                statsDownload: 'دانلود',
+                statsClients: 'توزیع کلاینت',
+                statsProto: 'توزیع پروتکل',
+                statsRegion: 'توزیع منطقه',
+                statsReqType: 'نوع درخواست',
+                statsTrend: 'روند (24 ساعت گذشته)',
+                statsRefresh: 'تازه‌سازی آمار',
+                statsWs: 'پروکسی',
+                statsSub: 'اشتراک',
+                statsPage: 'صفحه',
+                statsApi: 'API',
+                statsVsYesterday: 'vs دیروز',
+                statsNoData: 'بدون داده'
             }
         };
 
@@ -2826,7 +3210,88 @@
                 0%, 100% { opacity: 0.6; }
                 50% { opacity: 1; }
             }
+            /* === 统计仪表盘样式 === */
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                gap: 12px;
+                margin: 16px 0;
+            }
+            .stats-card {
+                background: rgba(0, 30, 0, 0.8);
+                border: 1px solid #00ff00;
+                padding: 14px;
+                text-align: center;
+                box-shadow: 0 0 10px rgba(0, 255, 0, 0.15);
+                transition: all 0.3s ease;
+            }
+            .stats-card:hover {
+                box-shadow: 0 0 20px rgba(0, 255, 0, 0.4);
+                transform: translateY(-2px);
+            }
+            .stats-card .stats-value {
+                font-size: 1.6rem;
+                font-weight: bold;
+                color: #00ff00;
+                text-shadow: 0 0 10px #00ff00;
+            }
+            .stats-card .stats-label {
+                font-size: 0.8rem;
+                color: #00aa00;
+                margin-top: 4px;
+            }
+            .stats-card .stats-compare {
+                font-size: 0.7rem;
+                margin-top: 4px;
+            }
+            .stats-compare.up { color: #ff4444; }
+            .stats-compare.down { color: #44ff44; }
+            .stats-compare.same { color: #888; }
+            .stats-tabs {
+                display: flex;
+                gap: 6px;
+                margin-bottom: 16px;
+                flex-wrap: wrap;
+            }
+            .stats-tab {
+                background: rgba(0, 20, 0, 0.8);
+                border: 1px solid #005500;
+                padding: 6px 14px;
+                color: #00aa00;
+                font-family: 'Courier New', monospace;
+                font-size: 0.85rem;
+                cursor: pointer;
+                transition: all 0.3s ease;
+            }
+            .stats-tab.active {
+                border-color: #00ff00;
+                color: #00ff00;
+                box-shadow: 0 0 10px rgba(0, 255, 0, 0.3);
+                text-shadow: 0 0 5px #00ff00;
+            }
+            .stats-charts {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 16px;
+                margin-top: 16px;
+            }
+            .stats-chart-box {
+                background: rgba(0, 20, 0, 0.6);
+                border: 1px solid #005500;
+                padding: 14px;
+                min-height: 220px;
+            }
+            .stats-chart-box h3 {
+                color: #00ff00;
+                font-size: 0.9rem;
+                margin-bottom: 10px;
+                text-shadow: 0 0 5px #00ff00;
+            }
+            .stats-chart-box canvas {
+                max-height: 200px;
+            }
         </style>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     </head>
     <body>
         <div class="matrix-bg"></div>
@@ -3183,6 +3648,49 @@
                 <div id="statusMessage" style="display: none; padding: 10px; margin: 10px 0; border: 1px solid #00ff00; background: rgba(0, 20, 0, 0.8); color: #00ff00; text-shadow: 0 0 5px #00ff00;"></div>
             </div>
             
+            <!-- 统计仪表盘 -->
+            <div class="card" id="statsCard" style="display: none;">
+                    <h2 class="card-title">${t.statsTitle}</h2>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <div class="stats-tabs" id="statsTabs">
+                        <button class="stats-tab active" onclick="switchStatsTab('today')">${t.statsToday}</button>
+                        <button class="stats-tab" onclick="switchStatsTab('yesterday')">${t.statsYesterday}</button>
+                        <button class="stats-tab" onclick="switchStatsTab('thisMonth')">${t.statsThisMonth}</button>
+                        <button class="stats-tab" onclick="switchStatsTab('allTime')">${t.statsAllTime}</button>
+                    </div>
+                    <button onclick="loadStats()" style="background: rgba(0, 255, 0, 0.15); border: 1px solid #00ff00; padding: 6px 12px; color: #00ff00; font-family: 'Courier New', monospace; font-size: 0.8rem; cursor: pointer; text-shadow: 0 0 5px #00ff00;">${t.statsRefresh}</button>
+                </div>
+                <div id="statsLoading" style="color: #00aa00; text-align: center; padding: 30px;">${t.statsLoading}</div>
+                <div id="statsContent" style="display: none;">
+                    <!-- 数据卡片 -->
+                    <div class="stats-grid" id="statsCards"></div>
+                    <!-- 趋势图表 -->
+                    <div class="stats-chart-box" style="margin-top: 16px;">
+                        <h3>${t.statsTrend}</h3>
+                        <canvas id="trendChart"></canvas>
+                    </div>
+                    <!-- 分布图表 -->
+                    <div class="stats-charts">
+                        <div class="stats-chart-box">
+                            <h3>${t.statsClients}</h3>
+                            <canvas id="clientChart"></canvas>
+                        </div>
+                        <div class="stats-chart-box">
+                            <h3>${t.statsReqType}</h3>
+                            <canvas id="reqTypeChart"></canvas>
+                        </div>
+                        <div class="stats-chart-box">
+                            <h3>${t.statsProto}</h3>
+                            <canvas id="protoChart"></canvas>
+                        </div>
+                        <div class="stats-chart-box">
+                            <h3>${t.statsRegion}</h3>
+                            <canvas id="regionChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div class="card">
                     <h2 class="card-title">${t.relatedLinks}</h2>
                 <div style="text-align: center; margin: 20px 0;">
@@ -4972,6 +5480,223 @@
                     }
                 }
             });
+
+            // === 统计仪表盘 ===
+            let statsData = null;
+            let currentStatsTab = 'today';
+            let statsCharts = {};
+
+            function formatBytes(bytes) {
+                if (!bytes || bytes === 0) return '0 B';
+                const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(1024));
+                return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+            }
+
+            function getCompareClass(current, previous) {
+                if (current > previous) return 'up';
+                if (current < previous) return 'down';
+                return 'same';
+            }
+
+            function getCompareText(current, previous) {
+                if (previous === 0) return current > 0 ? '↑ +' + current : '-';
+                const diff = current - previous;
+                const pct = Math.round((diff / previous) * 100);
+                if (diff > 0) return '↑ +' + pct + '%';
+                if (diff < 0) return '↓ ' + pct + '%';
+                return '→ 0%';
+            }
+
+            async function loadStats() {
+                const statsCard = document.getElementById('statsCard');
+                const statsLoading = document.getElementById('statsLoading');
+                const statsContent = document.getElementById('statsContent');
+
+                statsCard.style.display = 'block';
+                statsLoading.style.display = 'block';
+                statsContent.style.display = 'none';
+
+                try {
+                    const basePath = window.location.pathname.replace(/\\/$/, '');
+                    const resp = await fetch(basePath + '/api/stats');
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    statsData = await resp.json();
+                    renderStats();
+                    statsLoading.style.display = 'none';
+                    statsContent.style.display = 'block';
+                } catch (e) {
+                    statsLoading.textContent = '${isFarsi ? 'بارگذاری آمار ناموفق' : '加载统计数据失败'}: ' + e.message;
+                }
+            }
+
+            function switchStatsTab(tab) {
+                currentStatsTab = tab;
+                document.querySelectorAll('.stats-tab').forEach(b => b.classList.remove('active'));
+                event.target.classList.add('active');
+                renderStats();
+            }
+
+            function renderStats() {
+                if (!statsData) return;
+                const data = statsData[currentStatsTab] || {};
+                const yesterday = statsData.yesterday || {};
+
+                // 渲染数据卡片
+                const cardsHtml = \`
+                    <div class="stats-card">
+                        <div class="stats-value">\${(data.pv || 0).toLocaleString()}</div>
+                        <div class="stats-label">${isFarsi ? 'بازدید' : '访问量'} (PV)</div>
+                        \${currentStatsTab === 'today' ? '<div class="stats-compare ' + getCompareClass(data.pv||0, yesterday.pv||0) + '">${isFarsi ? 'vs دیروز' : 'vs 昨日'} ' + getCompareText(data.pv||0, yesterday.pv||0) + '</div>' : ''}
+                    </div>
+                    <div class="stats-card">
+                        <div class="stats-value">\${(data.uv || 0).toLocaleString()}</div>
+                        <div class="stats-label">${isFarsi ? 'بازدیدکننده' : '独立访客'} (UV)</div>
+                        \${currentStatsTab === 'today' ? '<div class="stats-compare ' + getCompareClass(data.uv||0, yesterday.uv||0) + '">${isFarsi ? 'vs دیروز' : 'vs 昨日'} ' + getCompareText(data.uv||0, yesterday.uv||0) + '</div>' : ''}
+                    </div>
+                    <div class="stats-card">
+                        <div class="stats-value">\${(data.conn || 0).toLocaleString()}</div>
+                        <div class="stats-label">${isFarsi ? 'اتصالات' : '连接数'}</div>
+                        \${currentStatsTab === 'today' ? '<div class="stats-compare ' + getCompareClass(data.conn||0, yesterday.conn||0) + '">${isFarsi ? 'vs دیروز' : 'vs 昨日'} ' + getCompareText(data.conn||0, yesterday.conn||0) + '</div>' : ''}
+                    </div>
+                    <div class="stats-card">
+                        <div class="stats-value">↑ \${formatBytes(data.traffic?.up || 0)}</div>
+                        <div class="stats-label">${isFarsi ? 'آپلود' : '上传'}</div>
+                    </div>
+                    <div class="stats-card">
+                        <div class="stats-value">↓ \${formatBytes(data.traffic?.down || 0)}</div>
+                        <div class="stats-label">${isFarsi ? 'دانلود' : '下载'}</div>
+                    </div>
+                \`;
+                document.getElementById('statsCards').innerHTML = cardsHtml;
+
+                // Chart.js 全局配色
+                const chartColors = ['#00ff00', '#00cc00', '#009900', '#00ff88', '#88ff00', '#00ffcc', '#ccff00', '#ff8800', '#ff0088', '#8800ff'];
+                const chartDefaults = {
+                    color: '#00aa00',
+                    borderColor: '#003300',
+                    font: { family: "'Courier New', monospace" }
+                };
+
+                // 销毁旧图表
+                Object.values(statsCharts).forEach(c => { try { c.destroy(); } catch(e){} });
+                statsCharts = {};
+
+                // 趋势图（24小时）
+                if (statsData.hourlyTrend && statsData.hourlyTrend.length > 0) {
+                    const ctx = document.getElementById('trendChart').getContext('2d');
+                    statsCharts.trend = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: statsData.hourlyTrend.map(h => h.hour),
+                            datasets: [
+                                {
+                                    label: 'PV',
+                                    data: statsData.hourlyTrend.map(h => h.pv),
+                                    borderColor: '#00ff00',
+                                    backgroundColor: 'rgba(0, 255, 0, 0.1)',
+                                    fill: true,
+                                    tension: 0.3,
+                                    pointRadius: 2,
+                                    pointBackgroundColor: '#00ff00'
+                                },
+                                {
+                                    label: 'UV',
+                                    data: statsData.hourlyTrend.map(h => h.uv),
+                                    borderColor: '#00cc88',
+                                    backgroundColor: 'rgba(0, 204, 136, 0.05)',
+                                    fill: true,
+                                    tension: 0.3,
+                                    pointRadius: 2,
+                                    pointBackgroundColor: '#00cc88'
+                                },
+                                {
+                                    label: '${isFarsi ? 'اتصالات' : '连接'}',
+                                    data: statsData.hourlyTrend.map(h => h.conn),
+                                    borderColor: '#88ff00',
+                                    backgroundColor: 'rgba(136, 255, 0, 0.05)',
+                                    fill: true,
+                                    tension: 0.3,
+                                    pointRadius: 2,
+                                    pointBackgroundColor: '#88ff00'
+                                }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: { legend: { labels: chartDefaults } },
+                            scales: {
+                                x: { ticks: { color: '#00aa00', font: { size: 10 } }, grid: { color: 'rgba(0,255,0,0.08)' } },
+                                y: { ticks: { color: '#00aa00' }, grid: { color: 'rgba(0,255,0,0.08)' }, beginAtZero: true }
+                            }
+                        }
+                    });
+                }
+
+                // 饼图辅助
+                function renderDoughnut(canvasId, dataObj, name) {
+                    if (!dataObj || Object.keys(dataObj).length === 0) return;
+                    const labels = Object.keys(dataObj);
+                    const values = Object.values(dataObj);
+                    const ctx = document.getElementById(canvasId).getContext('2d');
+                    statsCharts[name] = new Chart(ctx, {
+                        type: 'doughnut',
+                        data: {
+                            labels: labels,
+                            datasets: [{
+                                data: values,
+                                backgroundColor: chartColors.slice(0, labels.length),
+                                borderColor: '#001100',
+                                borderWidth: 1
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    position: 'right',
+                                    labels: { color: '#00aa00', font: { family: "'Courier New', monospace", size: 11 }, padding: 8 }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                renderDoughnut('clientChart', data.clients, 'client');
+                renderDoughnut('protoChart', data.proto, 'proto');
+
+                // 请求类型
+                const reqTypeData = {};
+                if (data.ws) reqTypeData['${isFarsi ? 'پروکسی' : '代理'} (WS)'] = data.ws;
+                if (data.sub) reqTypeData['${isFarsi ? 'اشتراک' : '订阅'} (SUB)'] = data.sub;
+                if (data.page) reqTypeData['${isFarsi ? 'صفحه' : '页面'} (PAGE)'] = data.page;
+                if (data.api) reqTypeData['API'] = data.api;
+                renderDoughnut('reqTypeChart', Object.keys(reqTypeData).length > 0 ? reqTypeData : null, 'reqType');
+
+                // 地区（前10）
+                if (data.region && Object.keys(data.region).length > 0) {
+                    const sorted = Object.entries(data.region).sort((a,b) => b[1] - a[1]).slice(0, 10);
+                    const regionData = {};
+                    sorted.forEach(([k, v]) => { regionData[k] = v; });
+                    renderDoughnut('regionChart', regionData, 'region');
+                }
+            }
+
+            // KV检测完成后加载统计
+            const origCheckKV = typeof checkKVStatus === 'function' ? checkKVStatus : null;
+            if (origCheckKV) {
+                const _origFn = checkKVStatus;
+                checkKVStatus = async function() {
+                    await _origFn();
+                    // KV 可用时加载统计
+                    setTimeout(() => loadStats(), 500);
+                };
+            } else {
+                // 延迟加载统计
+                setTimeout(() => loadStats(), 2000);
+            }
         </script>
     </body>
     </html>`;
@@ -5817,6 +6542,65 @@
             }
         }
         return links;
+    }
+
+    // === 统计 API 处理器 ===
+    async function handleStatsAPI(request, env) {
+        if (request.method !== 'GET') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        if (!env.C) {
+            return new Response(JSON.stringify({
+                error: 'KV存储未配置',
+                message: '需要配置KV存储才能使用统计功能'
+            }), {
+                status: 503,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+
+        // /api/stats/summary - 仪表盘摘要
+        if (url.pathname.endsWith('/stats/summary') || url.pathname.endsWith('/stats')) {
+            try {
+                const summary = await StatsManager.getSummary(env);
+                return new Response(JSON.stringify(summary), {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Cache-Control': 'no-cache'
+                    }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: '获取统计数据失败: ' + e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+        }
+
+        // /api/stats/query?period=d&value=20260430 - 查询指定时间段
+        const period = url.searchParams.get('period') || 'all';
+        const value = url.searchParams.get('value') || 'total';
+
+        try {
+            const stats = await StatsManager.getStats(env, period, value);
+            return new Response(JSON.stringify(stats || StatsManager._emptyStats()), {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'no-cache'
+                }
+            });
+        } catch (e) {
+            return new Response(JSON.stringify({ error: '查询失败: ' + e.message }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
     }
 
     async function handleConfigAPI(request) {
