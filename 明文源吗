@@ -1,6 +1,86 @@
     // CFnew - 终端 v2.9.6
-    // 版本: v2.9.6 
+    // 版本: v2.9.6
     import { connect } from 'cloudflare:sockets';
+
+    // === 统计系统核心配置 ===
+    const STATS_VERSION = 'v1';
+    const STATS_KEY_PREFIX = `stats:${STATS_VERSION}`;
+    const UV_EXPIRATION = 24 * 60 * 60; // UV 记录保留 24 小时
+
+    class StatsManager {
+        static async record(request, env, ctx, type = 'pv') {
+            if (!env.cbd) return;
+            ctx.waitUntil((async () => {
+                const now = new Date();
+                const year = now.getFullYear();
+                const month = String(now.getMonth() + 1).padStart(2, '0');
+                const day = String(now.getDate()).padStart(2, '0');
+                const hour = String(now.getHours()).padStart(2, '0');
+
+                // 获取客户端类型
+                const ua = request.headers.get('User-Agent') || '';
+                let client = 'Other';
+                if (/clash/i.test(ua)) client = 'Clash';
+                else if (/surge/i.test(ua)) client = 'Surge';
+                else if (/shadowrocket/i.test(ua)) client = 'Shadowrocket';
+                else if (/sing-box/i.test(ua)) client = 'Sing-box';
+                else if (/v2ray/i.test(ua)) client = 'V2Ray';
+                else if (/stash/i.test(ua)) client = 'Stash';
+                else if (/loon/i.test(ua)) client = 'Loon';
+                else if (/quantumult/i.test(ua)) client = 'QuantumultX';
+
+                // 时间维度标识
+                const periods = {
+                    h: `${year}${month}${day}${hour}`,
+                    d: `${year}${month}${day}`,
+                    m: `${year}${month}`,
+                    y: `${year}`,
+                    all: 'total'
+                };
+
+                const kv = env.cbd;
+                const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+
+                for (const [unit, val] of Object.entries(periods)) {
+                    const baseKey = `${STATS_KEY_PREFIX}:${unit}:${val}`;
+
+                    // 增加 PV/协议计数
+                    await this.increment(kv, `${baseKey}:type:${type}`);
+                    await this.increment(kv, `${baseKey}:client:${client}`);
+
+                    // 统计 UV
+                    const uvKey = `${STATS_KEY_PREFIX}:uv:${unit}:${val}:${ip}`;
+                    const isNewUV = await kv.get(uvKey);
+                    if (!isNewUV) {
+                        await kv.put(uvKey, '1', { expirationTtl: UV_EXPIRATION });
+                        await this.increment(kv, `${baseKey}:uv`);
+                    }
+                }
+            })());
+        }
+
+        static async increment(kv, key) {
+            const val = await kv.get(key);
+            await kv.put(key, (parseInt(val || '0') + 1).toString());
+        }
+
+        static async getStats(env, unit, val) {
+            const kv = env.cbd;
+            const prefix = `${STATS_KEY_PREFIX}:${unit}:${val}:`;
+            const list = await kv.list({ prefix });
+            const result = { types: {}, clients: {}, uv: 0 };
+
+            for (const key of list.keys) {
+                const value = await kv.get(key.name);
+                const subKey = key.name.replace(prefix, '');
+                if (subKey === 'uv') result.uv = parseInt(value || '0');
+                else if (subKey.startsWith('type:')) result.types[subKey.split(':')[1]] = parseInt(value || '0');
+                else if (subKey.startsWith('client:')) result.clients[subKey.split(':')[1]] = parseInt(value || '0');
+            }
+            return result;
+        }
+    }
+
     let at = '351c9981-04b6-4103-aa4b-864aa9c91469';
     let fallbackAddress = '';
     let socks5Config = '';
@@ -148,9 +228,9 @@
     }
 
     async function initKVStore(env) {
-        if (env.C) {
+        if (env.cbd) {
             try {
-                kvStore = env.C;
+                kvStore = env.cbd;
                 await loadKVConfig();
             } catch (error) {
                 kvStore = null;
@@ -343,7 +423,7 @@
                 const pathSegments = reqUrl.pathname.split('/').filter(p => p);
 
                 if (!isWebSocket && !isPost && reqUrl.pathname !== '/') {
-                    const tmpAt = (env.u || env.U || '').toLowerCase();
+                    const tmpAt = (env.usb || env.U || '').toLowerCase();
                     const tmpCp = (env.d || env.D || '').toLowerCase();
                     const firstSeg = pathSegments[0] || '';
                     const cleanCp = tmpCp.startsWith('/') ? tmpCp.substring(1) : tmpCp;
@@ -354,7 +434,7 @@
 
                 await initKVStore(env);
 
-                at = (env.u || env.U || at).toLowerCase();
+                at = (env.usb || env.U || at).toLowerCase();
                 const subPath = (env.d || env.D || at).toLowerCase();
 
                 const ci = getConfigValue('p', env.p || env.P);
