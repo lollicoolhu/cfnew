@@ -116,6 +116,67 @@
             })());
         }
 
+        // 获取所有活跃和近期的连接日志
+        static async getLogs(env) {
+            const kv = env.C;
+            if (!kv) return [];
+            try {
+                const list = await kv.list({ prefix: `${STATS_KEY_PREFIX}:log:`, limit: 100 });
+                const logs = [];
+                for (const key of list.keys) {
+                    const raw = await kv.get(key.name);
+                    if (raw) logs.push(JSON.parse(raw));
+                }
+                return logs.sort((a, b) => b.start - a.start);
+            } catch(e) { return []; }
+        }
+
+        // 记录新的代理连接日志
+        static async recordConnection(env, ctx, details) {
+            const kv = env.C;
+            if (!kv) return;
+            ctx.waitUntil((async () => {
+                try {
+                    const logKey = `${STATS_KEY_PREFIX}:log:${details.start}_${details.id}`;
+                    const logData = {
+                        id: details.id,
+                        target: details.target || 'unknown',
+                        client: details.client || 'unknown',
+                        proto: details.proto || 'unknown',
+                        start: details.start,
+                        end: null,
+                        up: 0,
+                        down: 0,
+                        status: 'active'
+                    };
+                    await kv.put(logKey, JSON.stringify(logData), { expirationTtl: 86400 });
+                } catch (e) {}
+            })());
+        }
+
+        static async updateConnection(env, ctx, connInfo, up, down) {
+            const kv = env.C;
+            if (!kv || !connInfo || !connInfo.id) return;
+            ctx.waitUntil((async () => {
+                try {
+                    const logKey = `${STATS_KEY_PREFIX}:log:${connInfo.start}_${connInfo.id}`;
+                    let logData;
+                    try {
+                        const raw = await kv.get(logKey);
+                        if (raw) logData = JSON.parse(raw);
+                    } catch (e) {}
+                    if (logData) {
+                        logData.up += (up || 0);
+                        logData.down += (down || 0);
+                        logData.end = Date.now();
+                        logData.status = 'closed';
+                        const remaining = Math.max(3600, 86400 - Math.floor((Date.now() - connInfo.start)/1000));
+                        await kv.put(logKey, JSON.stringify(logData), { expirationTtl: remaining });
+                    }
+                } catch (e) {}
+            })());
+        }
+
         // 记录流量（在连接关闭时调用）
         static async recordTraffic(env, ctx, uploadBytes, downloadBytes) {
             const kv = env.C;
@@ -1271,7 +1332,13 @@
                 0%, 100% { opacity: 0.6; }
                 50% { opacity: 1; }
             }
-        </style>
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.3; }
+            100% { opacity: 1; }
+        }
+</style>
     </head>
     <body>
         <div class="matrix-bg"></div>
@@ -2368,7 +2435,7 @@
         const [clientSock, serverSock] = Object.values(wsPair);
         serverSock.accept();
 
-        let remoteConnWrapper = { socket: null };
+        let remoteConnWrapper = { socket: null, connInfo: null, downBytes: 0, upBytes: 0 };
         let isDnsQuery = false;
         let protocolType = null; 
 
@@ -2379,6 +2446,7 @@
         readable.pipeTo(new WritableStream({
             async write(chunk) {
                 uploadBytes += chunk.byteLength || 0;
+                remoteConnWrapper.upBytes = uploadBytes;
                 if (isDnsQuery) return await forwardUDP(chunk, serverSock, null);
                 if (remoteConnWrapper.socket) {
                     const writer = remoteConnWrapper.socket.writable.getWriter();
@@ -2393,7 +2461,13 @@
                         if (!vlessResult.hasError) {
                             protocolType = 'vless';
                             // 记录协议类型
-                            if (_env && _ctx) StatsManager.record(request, _env, _ctx, 'ws', { proto: 'vless' });
+                            if (_env && _ctx) {
+                                StatsManager.record(request, _env, _ctx, 'ws', { proto: 'vless' });
+                                const connId = crypto.randomUUID();
+                                const connStart = Date.now();
+                                remoteConnWrapper.connInfo = { id: connId, start: connStart };
+                                StatsManager.recordConnection(_env, _ctx, { id: connId, target: hostname + ':' + port, client: StatsManager.getClientType ? StatsManager.getClientType(request) : 'Other', proto: 'vless', start: connStart });
+                            }
                             const { addressType, port, hostname, rawIndex, version, isUDP } = vlessResult;
                 if (isUDP) {
                     if (port === 53) isDnsQuery = true;
@@ -2412,7 +2486,13 @@
                         if (!tjResult.hasError) {
                             protocolType = atob('dHJvamFu');
                             // 记录协议类型
-                            if (_env && _ctx) StatsManager.record(request, _env, _ctx, 'ws', { proto: 'trojan' });
+                            if (_env && _ctx) {
+                                StatsManager.record(request, _env, _ctx, 'ws', { proto: 'trojan' });
+                                const connId = crypto.randomUUID();
+                                const connStart = Date.now();
+                                remoteConnWrapper.connInfo = { id: connId, start: connStart };
+                                StatsManager.recordConnection(_env, _ctx, { id: connId, target: hostname + ':' + port, client: StatsManager.getClientType ? StatsManager.getClientType(request) : 'Other', proto: 'trojan', start: connStart });
+                            }
                             const { addressType, port, hostname, rawClientData } = tjResult;
                             await forwardTCP(addressType, hostname, port, rawClientData, serverSock, null, remoteConnWrapper, reqFallback, effectiveRegion, reqRm, reqSocksConfig);
                             return;
@@ -2426,6 +2506,11 @@
             // 记录上传流量
             if (uploadBytes > 0 && _env && _ctx) {
                 StatsManager.recordTraffic(_env, _ctx, uploadBytes, 0);
+            }
+            if (remoteConnWrapper.connInfo && _env && _ctx) {
+                setTimeout(() => {
+                    StatsManager.updateConnection(_env, _ctx, remoteConnWrapper.connInfo, remoteConnWrapper.upBytes, remoteConnWrapper.downBytes);
+                }, 100);
             }
         });
 
@@ -2547,7 +2632,7 @@
         });
     }
 
-    async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
+    async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, remoteConnWrapper) {
         let header = headerData, hasData = false;
         let downloadBytes = 0;
         await remoteSocket.readable.pipeTo(
@@ -2555,6 +2640,7 @@
                 async write(chunk, controller) {
                     hasData = true;
                     downloadBytes += chunk.byteLength || 0;
+                    if (remoteConnWrapper) remoteConnWrapper.downBytes = downloadBytes;
                     if (webSocket.readyState !== 1) controller.error(E_WS_NOT_OPEN);
                     if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; } 
                     else { webSocket.send(chunk); }
@@ -3290,6 +3376,8 @@
             }
         </style>
         <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0"></script>
+        <script>Chart.register(ChartDataLabels);</script>
     </head>
     <body>
         <div class="matrix-bg"></div>
@@ -3667,6 +3755,26 @@
                         <h3>${t.statsTrend}</h3>
                         <canvas id="trendChart"></canvas>
                     </div>
+                    
+                    <div class="stats-chart-box" style="margin-top: 16px; overflow-x: auto;">
+                        <h3>链接详情 (最近24小时)</h3>
+                        <table style="width: 100%; text-align: left; border-collapse: collapse; font-size: 0.85rem;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid #00ff00; color: #00ff00;">
+                                    <th style="padding: 8px;">时间</th>
+                                    <th style="padding: 8px;">目标 (Target)</th>
+                                    <th style="padding: 8px;">客户端/协议</th>
+                                    <th style="padding: 8px;">上/下行流量</th>
+                                    <th style="padding: 8px;">时长</th>
+                                    <th style="padding: 8px;">状态</th>
+                                </tr>
+                            </thead>
+                            <tbody id="logsTableBody">
+                                <tr><td colspan="6" style="text-align:center; padding: 10px;">加载中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
                     <!-- 分布图表 -->
                     <div class="stats-charts">
                         <div class="stats-chart-box">
@@ -5499,6 +5607,63 @@
                 return '→ 0%';
             }
 
+            
+            let autoRefreshInterval = null;
+            function startAutoRefresh() {
+                if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+                fetchStatsSilent(); // fetch immediately for logs
+                autoRefreshInterval = setInterval(() => {
+                    fetchStatsSilent();
+                }, 5000);
+            }
+            async function fetchStatsSilent() {
+                try {
+                    const basePath = window.location.pathname.replace(/\/$/, '');
+                    const [statsResp, logsResp] = await Promise.all([
+                        fetch(basePath + '/api/stats'),
+                        fetch(basePath + '/api/stats/logs')
+                    ]);
+                    if (statsResp.ok) {
+                        statsData = await statsResp.json();
+                        renderStats();
+                    }
+                    if (logsResp.ok) {
+                        const logsData = await logsResp.json();
+                        renderLogs(logsData);
+                    }
+                } catch(e) {}
+            }
+            
+            function renderLogs(logs) {
+                const tbody = document.getElementById('logsTableBody');
+                if (!tbody) return;
+                if (!logs || logs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">暂无连接数据</td></tr>';
+                    return;
+                }
+                let html = '';
+                logs.forEach(log => {
+                    const statusColor = log.status === 'active' ? '#00ff00' : '#888';
+                    const activeAnim = log.status === 'active' ? 'animation: pulse 1s infinite;' : '';
+                    const dur = log.end ? ((log.end - log.start)/1000).toFixed(1) + 's' : ((Date.now() - log.start)/1000).toFixed(1) + 's';
+                    const upStr = (log.up / 1024).toFixed(1) + ' KB';
+                    const downStr = (log.down / 1024).toFixed(1) + ' KB';
+                    const dateStr = new Date(log.start).toLocaleTimeString();
+                    
+                    html += \`
+                    <tr>
+                        <td style="color:#00ff00">\${dateStr}</td>
+                        <td style="color:#00ffcc; word-break: break-all;">\${log.target}</td>
+                        <td style="color:#ffcc00">\${log.client} / \${log.proto}</td>
+                        <td style="color:#fff">\${upStr} / \${downStr}</td>
+                        <td style="color:#fff">\${dur}</td>
+                        <td><span style="color:\${statusColor}; \${activeAnim}">\${log.status === 'active' ? '● 活跃' : '○ 已关闭'}</span></td>
+                    </tr>
+                    \`;
+                });
+                tbody.innerHTML = html;
+            }
+
             async function loadStats() {
                 const statsCard = document.getElementById('statsCard');
                 const statsLoading = document.getElementById('statsLoading');
@@ -5516,6 +5681,7 @@
                     renderStats();
                     statsLoading.style.display = 'none';
                     statsContent.style.display = 'block';
+                    startAutoRefresh();
                 } catch (e) {
                     statsLoading.textContent = '${isFarsi ? 'بارگذاری آمار ناموفق' : '加载统计数据失败'}: ' + e.message;
                 }
@@ -5562,7 +5728,7 @@
                 document.getElementById('statsCards').innerHTML = cardsHtml;
 
                 // Chart.js 全局配色
-                const chartColors = ['#00ff00', '#00cc00', '#009900', '#00ff88', '#88ff00', '#00ffcc', '#ccff00', '#ff8800', '#ff0088', '#8800ff'];
+                const chartColors = ['#00ff00', '#ff3366', '#33ccff', '#ffcc00', '#cc33ff', '#ff6600', '#00ffcc', '#ff99cc', '#99ff33', '#3366ff', '#ff3300'];
                 const chartDefaults = {
                     color: '#00aa00',
                     borderColor: '#003300',
@@ -5616,7 +5782,19 @@
                         options: {
                             responsive: true,
                             maintainAspectRatio: false,
-                            plugins: { legend: { labels: chartDefaults } },
+                            plugins: { legend: { labels: chartDefaults }, 
+                                datalabels: {
+                                    color: '#000',
+                                    font: { weight: 'bold', size: 10 },
+                                    formatter: (value, ctx) => {
+                                        let sum = 0;
+                                        let dataArr = ctx.chart.data.datasets[0].data;
+                                        dataArr.map(data => { sum += data; });
+                                        let percentage = (value * 100 / sum).toFixed(1) + "%";
+                                        return percentage;
+                                    }
+                                },
+ },
                             scales: {
                                 x: { ticks: { color: '#00aa00', font: { size: 10 } }, grid: { color: 'rgba(0,255,0,0.08)' } },
                                 y: { ticks: { color: '#00aa00' }, grid: { color: 'rgba(0,255,0,0.08)' }, beginAtZero: true }
@@ -6568,6 +6746,24 @@
                 });
             } catch (e) {
                 return new Response(JSON.stringify({ error: '获取统计数据失败: ' + e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+        }
+
+        // /api/stats/logs - 获取历史和活跃连接日志
+        if (url.pathname.endsWith('/stats/logs')) {
+            try {
+                const logs = await StatsManager.getLogs(env);
+                return new Response(JSON.stringify(logs), {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Cache-Control': 'no-cache'
+                    }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: '获取日志失败: ' + e.message }), {
                     status: 500,
                     headers: { 'Content-Type': 'application/json' }
                 });
