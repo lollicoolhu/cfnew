@@ -9,7 +9,7 @@
 
     class StatsManager {
         static async record(request, env, ctx, type = 'pv') {
-            if (!env.cbd) return;
+            if (!env.C) return;
             ctx.waitUntil((async () => {
                 const now = new Date();
                 const year = now.getFullYear();
@@ -38,7 +38,7 @@
                     all: 'total'
                 };
 
-                const kv = env.cbd;
+                const kv = env.C;
                 const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
 
                 for (const [unit, val] of Object.entries(periods)) {
@@ -65,7 +65,7 @@
         }
 
         static async getStats(env, unit, val) {
-            const kv = env.cbd;
+            const kv = env.C;
             const prefix = `${STATS_KEY_PREFIX}:${unit}:${val}:`;
             const list = await kv.list({ prefix });
             const result = { types: {}, clients: {}, uv: 0 };
@@ -423,7 +423,7 @@
                 const pathSegments = reqUrl.pathname.split('/').filter(p => p);
 
                 if (!isWebSocket && !isPost && reqUrl.pathname !== '/') {
-                    const tmpAt = (env.usb || env.U || '').toLowerCase();
+                    const tmpAt = (env.u || env.U || '').toLowerCase();
                     const tmpCp = (env.d || env.D || '').toLowerCase();
                     const firstSeg = pathSegments[0] || '';
                     const cleanCp = tmpCp.startsWith('/') ? tmpCp.substring(1) : tmpCp;
@@ -434,7 +434,7 @@
 
                 await initKVStore(env);
 
-                at = (env.usb || env.U || at).toLowerCase();
+                at = (env.u || env.U || at).toLowerCase();
                 const subPath = (env.d || env.D || at).toLowerCase();
 
                 const ci = getConfigValue('p', env.p || env.P);
